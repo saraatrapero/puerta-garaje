@@ -1,0 +1,9 @@
+{
+  "name": "Copy of SmartGarage Pro - ESP32 Control Center",
+  "description": "An advanced AI-powered garage management system that uses Gemini for license plate recognition, automated entry control, and multi-factor authentication (2FA) via proximity and voice.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}
