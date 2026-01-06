@@ -33,10 +33,18 @@ export interface AccessLog {
   reason?: string;
 }
 
+export interface ChargeSchedule {
+  startHour: number;
+  endHour: number;
+  enabled: boolean;
+}
+
 export interface HardwareStatus {
   esp32_connected: boolean;
   camera_status: 'ONLINE' | 'OFFLINE';
-  reed_switch: 'TRIGGERED' | 'IDLE'; // Reed switch for open/close detection
+  reed_switch: 'TRIGGERED' | 'IDLE';
   relay_state: boolean;
   signal_strength: number;
+  is_charging: boolean;
+  cpu_temp: number;
 }
