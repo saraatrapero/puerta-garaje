@@ -1,9 +1,10 @@
 
 export enum DoorStatus {
-  OPEN = 'OPEN',
-  CLOSED = 'CLOSED',
-  OPENING = 'OPENING',
-  CLOSING = 'CLOSING'
+  OPEN = 'ABIERTA',
+  CLOSED = 'CERRADA',
+  OPENING = 'ABRIENDO',
+  CLOSING = 'CERRANDO',
+  STOPPED = 'DETENIDA'
 }
 
 export enum UserType {
@@ -18,9 +19,9 @@ export interface AccessUser {
   phone: string;
   plate: string;
   type: UserType;
+  active: boolean;
   startDate?: string;
   endDate?: string;
-  active: boolean;
 }
 
 export interface AccessLog {
@@ -37,14 +38,4 @@ export interface ChargeSchedule {
   startHour: number;
   endHour: number;
   enabled: boolean;
-}
-
-export interface HardwareStatus {
-  esp32_connected: boolean;
-  camera_status: 'ONLINE' | 'OFFLINE';
-  reed_switch: 'TRIGGERED' | 'IDLE';
-  relay_state: boolean;
-  signal_strength: number;
-  is_charging: boolean;
-  cpu_temp: number;
 }

@@ -1,125 +1,197 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { DoorStatus, UserType, AccessUser, AccessLog, ChargeSchedule } from './types';
+import { DoorStatus, UserType, AccessUser, AccessLog } from './types';
 import HardwareRequirements from './components/HardwareRequirements';
-import { recognizeLicensePlate, analyzeSecurityLogs } from './services/geminiService';
-import { GoogleGenAI, Modality } from '@google/genai';
+import { recognizeLicensePlate } from './services/geminiService';
+import { GoogleGenAI, Modality, LiveServerMessage } from "@google/genai";
+
+// Audio Helpers
+function encode(bytes: Uint8Array) {
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function decode(base64: string) {
+  const binaryString = atob(base64);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+  return bytes;
+}
+
+async function decodeAudioData(data: Uint8Array, ctx: AudioContext, sampleRate: number, numChannels: number): Promise<AudioBuffer> {
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+  }
+  return buffer;
+}
 
 const App: React.FC = () => {
-  // State
   const [doorState, setDoorState] = useState<DoorStatus>(DoorStatus.CLOSED);
-  const [users, setUsers] = useState<AccessUser[]>([
-    { id: '1', name: 'Admin Principal', phone: '+34600112233', plate: '1234ABC', type: UserType.PERMANENT, active: true },
-    { id: '2', name: 'Visita Juan', phone: '+34611223344', plate: '5678DEF', type: UserType.TEMPORARY, startDate: '2023-10-01T08:00', endDate: '2023-10-31T20:00', active: true },
-  ]);
-  const [logs, setLogs] = useState<AccessLog[]>([
-    { id: 'l1', timestamp: new Date().toISOString(), userName: 'Admin Principal', plate: '1234ABC', action: 'ENTRY', method: 'LPR' }
-  ]);
-  
-  // Advanced Battery & Thermal Logic
-  const [batteryLevel, setBatteryLevel] = useState(15); // Empezamos cerca del umbral
-  const [chargingRequested, setChargingRequested] = useState(false); // Si el ciclo de carga está "on"
-  const [isChargingActive, setIsChargingActive] = useState(false); // Estado real del PIN D3
-  const [cpuTemp, setCpuTemp] = useState(38);
-  const [isProcessing, setIsProcessing] = useState(false);
-
-  const [isAwaiting2FA, setIsAwaiting2FA] = useState<AccessUser | null>(null);
-  const [showUserModal, setShowUserModal] = useState(false);
   const [activeTab, setActiveTab] = useState<'dashboard' | 'users' | 'logs' | 'power' | 'hardware'>('dashboard');
   
+  // Power & Thermal Management
+  const [batteryLevel, setBatteryLevel] = useState(15);
+  const [chargingCycleRequired, setChargingCycleRequired] = useState(false); // Histéresis 10-100%
+  const [isChargingActive, setIsChargingActive] = useState(false); // Estado real Pin D3
+  const [isProcessing, setIsProcessing] = useState(false); // Actividad Cámara/LPR
+  const [cpuTemp, setCpuTemp] = useState(35);
+
+  const [users] = useState<AccessUser[]>([
+    { id: '1', name: 'Admin Principal', phone: '+34600112233', plate: '1234ABC', type: UserType.PERMANENT, active: true },
+  ]);
+  const [logs, setLogs] = useState<AccessLog[]>([]);
+  const [isAwaiting2FA, setIsAwaiting2FA] = useState<AccessUser | null>(null);
+
+  // Live Intercom State
+  const [isIntercomActive, setIsIntercomActive] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
+  const intercomSessionRef = useRef<any>(null);
+  const audioContextInRef = useRef<AudioContext | null>(null);
+  const audioContextOutRef = useRef<AudioContext | null>(null);
+  const nextStartTimeRef = useRef(0);
+  const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Ciclo de Vida de Carga Inteligente
+  // Ciclo de Vida Inteligente de Batería y Temperatura
   useEffect(() => {
     const batteryManager = setInterval(() => {
       setBatteryLevel(prev => {
-        // Lógica de histéresis (10% - 100%)
-        if (prev <= 10) setChargingRequested(true);
-        if (prev >= 100) setChargingRequested(false);
+        // Lógica de histéresis: activa a 10%, desactiva a 100%
+        if (prev <= 10) setChargingCycleRequired(true);
+        if (prev >= 100) setChargingCycleRequired(false);
 
-        // Simulación de consumo/carga
         if (isChargingActive) return Math.min(100, prev + 0.5);
         return Math.max(0, prev - 0.1);
       });
 
-      // Simulación de Temperatura
+      // Simulación de Temperatura (Procesador + Carga)
       setCpuTemp(prev => {
-        let target = 35;
+        let target = 32;
         if (isChargingActive) target += 10;
-        if (isProcessing) target += 15;
-        return prev < target ? prev + 0.5 : prev - 0.2;
+        if (isProcessing || isIntercomActive) target += 15;
+        return prev < target ? prev + 0.4 : prev - 0.2;
       });
     }, 2000);
-
     return () => clearInterval(batteryManager);
-  }, [isChargingActive, isProcessing]);
+  }, [isChargingActive, isProcessing, isIntercomActive]);
 
-  // Lógica de Control del Pin D3 (Hardware Real)
+  // Lógica del Pin D3 (MOSFET de Carga)
   useEffect(() => {
-    // Solo cargamos si se ha solicitado ciclo de carga Y NO estamos procesando video
-    const hardwareD3 = chargingRequested && !isProcessing;
-    setIsChargingActive(hardwareD3);
-  }, [chargingRequested, isProcessing]);
+    // REGLA: Solo cargar si el ciclo lo pide Y NO hay actividad de video/voz
+    const hardwareD3State = chargingCycleRequired && !isProcessing && !isIntercomActive;
+    setIsChargingActive(hardwareD3State);
+  }, [chargingCycleRequired, isProcessing, isIntercomActive]);
 
-  // --- Gemini LPR Logic ---
-  const handleLPRSimulation = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  // --- Live Intercom Logic ---
+  const startIntercom = async () => {
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      audioContextInRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      audioContextOutRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setIsIntercomActive(true);
+
+      const sessionPromise = ai.live.connect({
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+        callbacks: {
+          onopen: () => {
+            const source = audioContextInRef.current!.createMediaStreamSource(stream);
+            const scriptProcessor = audioContextInRef.current!.createScriptProcessor(4096, 1, 1);
+            scriptProcessor.onaudioprocess = (e) => {
+              const inputData = e.inputBuffer.getChannelData(0);
+              let sum = 0;
+              for(let i=0; i<inputData.length; i++) sum += inputData[i]*inputData[i];
+              setMicLevel(Math.sqrt(sum / inputData.length) * 100);
+              const int16 = new Int16Array(inputData.length);
+              for (let i = 0; i < inputData.length; i++) int16[i] = inputData[i] * 32768;
+              sessionPromise.then(session => session.sendRealtimeInput({ media: { data: encode(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' } }));
+            };
+            source.connect(scriptProcessor);
+            scriptProcessor.connect(audioContextInRef.current!.destination);
+          },
+          onmessage: async (m: LiveServerMessage) => {
+            const b64 = m.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+            if (b64) {
+              const ctx = audioContextOutRef.current!;
+              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+              const buf = await decodeAudioData(decode(b64), ctx, 24000, 1);
+              const src = ctx.createBufferSource();
+              src.buffer = buf;
+              src.connect(ctx.destination);
+              src.start(nextStartTimeRef.current);
+              nextStartTimeRef.current += buf.duration;
+              sourcesRef.current.add(src);
+              src.onended = () => sourcesRef.current.delete(src);
+            }
+          },
+          onclose: () => stopIntercom()
+        },
+        config: {
+          responseModalities: [Modality.AUDIO],
+          systemInstruction: 'Eres el interfono de seguridad de un garaje. Habla con claridad y profesionalidad.'
+        }
+      });
+      intercomSessionRef.current = await sessionPromise;
+    } catch (e) { console.error(e); }
+  };
+
+  const stopIntercom = () => {
+    intercomSessionRef.current?.close();
+    setIsIntercomActive(false);
+    setMicLevel(0);
+    audioContextInRef.current?.close();
+    audioContextOutRef.current?.close();
+  };
+
+  const triggerRelay = (action: 'OPEN' | 'CLOSE' | 'STOP', user?: AccessUser) => {
+    const statusMap = { OPEN: DoorStatus.OPENING, CLOSE: DoorStatus.CLOSING, STOP: DoorStatus.STOPPED };
+    setDoorState(statusMap[action]);
+    if (user && action === 'OPEN') {
+      setLogs([{ id: Math.random().toString(36).substr(2, 9), timestamp: new Date().toISOString(), userName: user.name, plate: user.plate, action: 'ENTRY', method: 'LPR' }, ...logs]);
+      setIsAwaiting2FA(null);
+    }
+    if (action !== 'STOP') setTimeout(() => setDoorState(action === 'OPEN' ? DoorStatus.OPEN : DoorStatus.CLOSED), 4000);
+  };
+
+  const handleLPR = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    
-    setIsProcessing(true); // Esto apaga automáticamente el Pin D3
-    
+    setIsProcessing(true);
     const reader = new FileReader();
     reader.onloadend = async () => {
-      const base64 = (reader.result as string).split(',')[1];
-      const plate = await recognizeLicensePlate(base64);
-      
+      const b64 = (reader.result as string).split(',')[1];
+      const plate = await recognizeLicensePlate(b64);
       if (plate) {
-        const foundUser = users.find(u => u.plate === plate.replace(/\s/g, ''));
-        if (foundUser && foundUser.type !== UserType.BLACKLISTED && foundUser.active) {
-          setIsAwaiting2FA(foundUser);
-        }
+        const found = users.find(u => u.plate === plate);
+        if (found) setIsAwaiting2FA(found);
       }
-      
-      // Simular un pequeño delay de procesamiento para ver el efecto térmico
       setTimeout(() => setIsProcessing(false), 2000);
     };
     reader.readAsDataURL(file);
   };
 
-  const executeOpen = (user: AccessUser) => {
-    setDoorState(DoorStatus.OPENING);
-    setIsAwaiting2FA(null);
-    setTimeout(() => {
-      setDoorState(DoorStatus.OPEN);
-      setLogs(prev => [{
-        id: Math.random().toString(36).substr(2, 9),
-        timestamp: new Date().toISOString(),
-        userName: user.name,
-        plate: user.plate,
-        action: 'ENTRY',
-        method: 'LPR'
-      }, ...prev]);
-    }, 2000);
-  };
-
   return (
-    <div className="min-h-screen bg-[#f8fafc] pb-24">
-      <header className="bg-slate-900 text-white p-6 sticky top-0 z-50 shadow-2xl">
+    <div className="min-h-screen bg-[#f1f5f9] pb-28">
+      <header className="bg-slate-900 p-6 sticky top-0 z-50 shadow-xl border-b border-indigo-500/20">
         <div className="max-w-6xl mx-auto flex justify-between items-center">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-orange-600 rounded-xl flex items-center justify-center shadow-lg shadow-orange-900/40">
-              <i className="fas fa-microchip text-xl"></i>
+          <div className="flex items-center gap-4">
+            <div className="w-12 h-12 bg-indigo-600 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-900/40">
+              <i className="fas fa-microchip text-white text-xl"></i>
             </div>
             <div>
-              <h1 className="text-lg font-black tracking-tighter uppercase leading-none">XIAO <span className="text-orange-400">ECO</span></h1>
-              <p className="text-[9px] text-slate-400 font-bold tracking-widest mt-1">THERMAL GUARD ACTIVE</p>
+              <h1 className="text-white font-black uppercase tracking-tighter text-xl">XIAO <span className="text-indigo-400">SMART-POWER</span></h1>
+              <p className="text-[9px] text-slate-400 font-bold tracking-widest uppercase">Modelo 400 Integrated</p>
             </div>
           </div>
-          <div className="hidden md:flex gap-6">
-            {['dashboard', 'users', 'logs', 'power', 'hardware'].map(tab => (
-              <button key={tab} onClick={() => setActiveTab(tab as any)} className={`text-[10px] font-black uppercase tracking-widest transition-all ${activeTab === tab ? 'text-orange-400 scale-105' : 'text-slate-400 hover:text-white'}`}>
-                {tab}
-              </button>
+          <div className="hidden md:flex gap-8">
+            {['dashboard', 'users', 'logs', 'power', 'hardware'].map(t => (
+              <button key={t} onClick={() => setActiveTab(t as any)} className={`text-[10px] font-black uppercase tracking-widest ${activeTab === t ? 'text-indigo-400 underline underline-offset-8' : 'text-slate-500'}`}>{t}</button>
             ))}
           </div>
         </div>
@@ -128,168 +200,102 @@ const App: React.FC = () => {
       <main className="max-w-6xl mx-auto p-4 md:p-8">
         {activeTab === 'dashboard' && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <div className="lg:col-span-2 bg-white rounded-[3rem] p-10 shadow-sm border border-slate-100 flex flex-col items-center relative overflow-hidden">
-              <div className="absolute top-8 left-8 flex items-center gap-3">
-                 <div className={`px-4 py-2 rounded-2xl border flex items-center gap-2 ${isChargingActive ? 'bg-teal-50 border-teal-100 text-teal-600' : 'bg-slate-50 border-slate-100 text-slate-500'}`}>
-                    <i className={`fas ${isChargingActive ? 'fa-plug-circle-check' : 'fa-battery-full'} text-xs`}></i>
-                    <span className="text-[10px] font-black uppercase tracking-widest">{isChargingActive ? 'Carga Directa' : 'Modo Batería'}</span>
+            <div className="lg:col-span-2 bg-white rounded-[3.5rem] p-12 shadow-sm border border-slate-200 flex flex-col items-center relative overflow-hidden">
+              
+              {/* Telemetría en Tiempo Real */}
+              <div className="absolute top-10 left-10 flex gap-3">
+                 <div className={`px-4 py-2 rounded-2xl border flex items-center gap-3 ${isChargingActive ? 'bg-indigo-50 border-indigo-100 text-indigo-600' : 'bg-slate-50 border-slate-100 text-slate-400'}`}>
+                    <i className={`fas ${isChargingActive ? 'fa-bolt-lightning animate-pulse' : 'fa-battery-full'}`}></i>
+                    <span className="text-[10px] font-black uppercase tracking-widest">{isChargingActive ? 'Cargando de 220V' : 'Modo Batería'}</span>
                  </div>
-                 {isProcessing && (
+                 {(isProcessing || isIntercomActive) && (
                    <div className="px-4 py-2 rounded-2xl bg-orange-50 border border-orange-100 text-orange-600 flex items-center gap-2 animate-pulse">
-                      <i className="fas fa-video text-xs"></i>
-                      <span className="text-[10px] font-black uppercase tracking-widest">LPR Activo: Carga en Pausa</span>
+                      <i className="fas fa-shield-halved"></i>
+                      <span className="text-[10px] font-black uppercase tracking-widest">Protección Térmica</span>
                    </div>
                  )}
               </div>
 
-              <div className={`relative w-64 h-64 rounded-full flex items-center justify-center transition-all duration-1000 ${doorState === DoorStatus.OPEN ? 'bg-teal-50' : 'bg-slate-50'}`}>
-                <div className={`absolute inset-0 rounded-full border-2 border-dashed ${doorState === DoorStatus.OPEN ? 'border-teal-200 animate-spin-slow' : 'border-slate-200'}`}></div>
-                <i className={`fas ${doorState === DoorStatus.OPEN ? 'fa-door-open text-teal-500' : 'fa-door-closed text-slate-400'} text-7xl`}></i>
+              <div className={`w-72 h-72 rounded-full flex items-center justify-center transition-all duration-1000 ${doorState === DoorStatus.OPEN ? 'bg-teal-50' : 'bg-slate-50'}`}>
+                <div className={`absolute w-80 h-80 rounded-full border-2 border-dashed ${doorState === DoorStatus.OPENING || doorState === DoorStatus.CLOSING ? 'border-indigo-400 animate-spin-slow' : 'border-slate-100'}`}></div>
+                <i className={`fas ${doorState === DoorStatus.OPEN ? 'fa-door-open text-teal-500' : 'fa-door-closed text-slate-300'} text-8xl`}></i>
               </div>
-              
-              <h2 className="text-5xl font-black mt-8 text-slate-800 uppercase tracking-tighter">{doorState}</h2>
-              
-              {isAwaiting2FA && (
-                <div className="mt-8 p-6 bg-slate-900 rounded-3xl text-white flex items-center gap-6 animate-bounce shadow-2xl">
-                  <div className="w-12 h-12 bg-orange-500 rounded-xl flex items-center justify-center">
-                    <i className="fas fa-shield-check"></i>
-                  </div>
-                  <div>
-                    <p className="text-[10px] font-black text-orange-400 uppercase tracking-widest">Usuario Detectado</p>
-                    <p className="font-bold">{isAwaiting2FA.name} ({isAwaiting2FA.plate})</p>
-                  </div>
-                  <button onClick={() => executeOpen(isAwaiting2FA)} className="bg-orange-500 text-white px-6 py-2 rounded-xl font-black text-xs">ABRIR</button>
-                </div>
-              )}
 
-              <div className="flex gap-4 mt-10">
-                <button onClick={() => setDoorState(doorState === DoorStatus.CLOSED ? DoorStatus.OPEN : DoorStatus.CLOSED)} className="px-12 py-5 bg-slate-900 text-white rounded-[2rem] font-black hover:bg-orange-600 transition-all shadow-xl shadow-slate-200">
-                  {doorState === DoorStatus.CLOSED ? 'ABRIR PUERTA' : 'CERRAR PUERTA'}
+              <h2 className="text-5xl font-black mt-10 text-slate-900 tracking-tighter uppercase">{doorState}</h2>
+
+              {/* Controles de 3 Botones (X7) */}
+              <div className="grid grid-cols-3 gap-6 mt-12 w-full max-w-md">
+                <button onClick={() => triggerRelay('OPEN')} className="flex flex-col items-center gap-3 p-6 bg-slate-900 text-white rounded-[2.5rem] hover:bg-indigo-600 transition-all shadow-xl active:scale-95 group">
+                  <i className="fas fa-chevron-up text-xl group-hover:-translate-y-1 transition-transform"></i>
+                  <span className="text-[10px] font-black uppercase tracking-widest">Abrir</span>
                 </button>
-                <button onClick={() => fileInputRef.current?.click()} className="p-5 bg-white border border-slate-200 rounded-[2rem] text-slate-400 hover:text-orange-600 transition-all shadow-sm">
-                  <i className="fas fa-camera-viewfinder text-2xl"></i>
+                <button onClick={() => triggerRelay('STOP')} className="flex flex-col items-center gap-3 p-6 bg-rose-500 text-white rounded-[2.5rem] hover:bg-rose-600 transition-all shadow-xl active:scale-95 group">
+                  <i className="fas fa-stop text-xl group-hover:scale-110 transition-transform"></i>
+                  <span className="text-[10px] font-black uppercase tracking-widest">Parar</span>
                 </button>
-                <input type="file" ref={fileInputRef} className="hidden" accept="image/*" onChange={handleLPRSimulation} />
+                <button onClick={() => triggerRelay('CLOSE')} className="flex flex-col items-center gap-3 p-6 bg-slate-900 text-white rounded-[2.5rem] hover:bg-indigo-600 transition-all shadow-xl active:scale-95 group">
+                  <i className="fas fa-chevron-down text-xl group-hover:translate-y-1 transition-transform"></i>
+                  <span className="text-[10px] font-black uppercase tracking-widest">Cerrar</span>
+                </button>
               </div>
+
+              {/* Interfono de Voz */}
+              <div className="mt-10 flex flex-col items-center gap-3">
+                <button 
+                  onClick={isIntercomActive ? stopIntercom : startIntercom}
+                  className={`w-16 h-16 rounded-full flex items-center justify-center transition-all ${isIntercomActive ? 'bg-rose-600 animate-pulse text-white' : 'bg-indigo-100 text-indigo-600 hover:bg-indigo-200'}`}
+                >
+                  <i className={`fas ${isIntercomActive ? 'fa-microphone-slash' : 'fa-microphone'} text-xl`}></i>
+                </button>
+                <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Interfono Digital XIAO</span>
+              </div>
+              
+              <button onClick={() => fileInputRef.current?.click()} className="mt-8 text-slate-300 hover:text-indigo-400 font-bold text-[9px] uppercase tracking-widest">Lanzar LPR Manual</button>
+              <input type="file" ref={fileInputRef} className="hidden" onChange={handleLPR} />
             </div>
 
             <div className="space-y-6">
-              {/* Nuevo Panel de Salud Energética */}
-              <div className="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-100 relative overflow-hidden group">
-                <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-6">Salud Energética (ESP32)</h3>
-                
-                <div className="flex justify-between items-end mb-4">
-                  <div>
-                    <p className="text-4xl font-black text-slate-800 tracking-tighter">{batteryLevel.toFixed(0)}%</p>
-                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Batería LiPo</p>
+              {/* Salud de Batería e IA */}
+              <div className="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-200 overflow-hidden relative">
+                <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-8">Estado de Energía</h3>
+                <div className="space-y-6">
+                  <div className="flex justify-between items-end">
+                    <div>
+                      <p className="text-4xl font-black text-slate-900 tracking-tighter">{batteryLevel.toFixed(0)}%</p>
+                      <p className="text-[10px] font-black text-slate-400 uppercase mt-1">Carga Actual</p>
+                    </div>
+                    <div className="text-right">
+                      <p className={`text-xl font-black tracking-tighter ${cpuTemp > 45 ? 'text-orange-500' : 'text-slate-900'}`}>{cpuTemp.toFixed(1)}°C</p>
+                      <p className="text-[10px] font-black text-slate-400 uppercase mt-1">CPU XIAO S3</p>
+                    </div>
                   </div>
-                  <div className="text-right">
-                    <p className={`text-xl font-black tracking-tighter ${cpuTemp > 48 ? 'text-orange-500' : 'text-slate-800'}`}>
-                      {cpuTemp.toFixed(1)}°C
-                    </p>
-                    <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">Temperatura</p>
+                  <div className="h-3 w-full bg-slate-100 rounded-full overflow-hidden">
+                    <div className={`h-full transition-all duration-1000 ${isChargingActive ? 'bg-indigo-500' : 'bg-teal-500'}`} style={{ width: `${batteryLevel}%` }}></div>
                   </div>
-                </div>
-
-                <div className="relative h-4 w-full bg-slate-100 rounded-full overflow-hidden mb-6">
-                   <div 
-                    className={`h-full transition-all duration-1000 ${batteryLevel < 20 ? 'bg-orange-500' : 'bg-teal-500'}`} 
-                    style={{ width: `${batteryLevel}%` }}></div>
-                   {chargingRequested && (
-                     <div className="absolute inset-0 bg-white/20 animate-pulse"></div>
-                   )}
-                </div>
-
-                <div className="space-y-3">
-                  <div className="flex justify-between text-[10px] font-black uppercase">
-                    <span className="text-slate-400">Ciclo Carga (10%-100%)</span>
-                    <span className={chargingRequested ? 'text-teal-600' : 'text-slate-400'}>{chargingRequested ? 'REQUERIDO' : 'IDLE'}</span>
+                  <div className={`p-4 rounded-2xl text-[10px] font-black uppercase leading-tight border ${isChargingActive ? 'bg-indigo-50 border-indigo-100 text-indigo-700' : 'bg-slate-50 border-slate-100 text-slate-500'}`}>
+                     <i className={`fas ${isChargingActive ? 'fa-bolt mr-2' : 'fa-moon mr-2'}`}></i>
+                     {isChargingActive 
+                        ? 'Carga Activa: Alimentador de 220V conectado' 
+                        : isProcessing || isIntercomActive
+                           ? 'Carga Pausada: Protegiendo hardware por actividad'
+                           : 'Alimentador de 220V Desconectado (Modo Eco)'}
                   </div>
-                  <div className="flex justify-between text-[10px] font-black uppercase">
-                    <span className="text-slate-400">Protección Térmica Video</span>
-                    <span className={isProcessing ? 'text-orange-600' : 'text-teal-600'}>{isProcessing ? 'ACTIVADA' : 'STANDBY'}</span>
-                  </div>
-                </div>
-
-                <div className={`mt-6 p-4 rounded-2xl text-[10px] font-bold uppercase leading-tight ${
-                  isChargingActive ? 'bg-teal-50 text-teal-700 border border-teal-100' : 'bg-slate-50 text-slate-500 border border-slate-100'
-                }`}>
-                   <i className={`fas ${isChargingActive ? 'fa-bolt-lightning mr-2' : 'fa-leaf mr-2'}`}></i>
-                   {isChargingActive 
-                     ? 'Cargando: Alimentador de luz activo' 
-                     : isProcessing 
-                        ? 'Carga detenida para enfriar el procesador' 
-                        : 'Consumiendo batería externa (Alimentador Off)'}
                 </div>
               </div>
 
-              <div className="bg-slate-900 p-8 rounded-[2.5rem] shadow-xl text-white relative">
-                 <h3 className="text-[10px] font-black text-orange-400 uppercase tracking-widest mb-4">Gemini Insight</h3>
-                 <p className="text-sm text-slate-400 leading-relaxed italic">
-                   "Lógica térmica optimizada: La batería externa ahora maneja el 100% de la carga hasta caer al 10%. Esto reduce el estrés térmico en el chip XIAO un 40%."
-                 </p>
+              <div className="bg-slate-900 p-8 rounded-[2.5rem] text-white shadow-2xl relative">
+                <h3 className="text-[10px] font-black text-indigo-400 uppercase tracking-widest mb-4">Gemini Bridge</h3>
+                <p className="text-sm text-slate-400 leading-relaxed italic">"He configurado la carga por umbrales: El cargador dormirá hasta que la batería llegue al 10%, optimizando la salud del circuito del XIAO."</p>
               </div>
             </div>
           </div>
         )}
-
-        {activeTab === 'power' && (
-          <div className="space-y-8 animate-fadeIn">
-            <div className="bg-white p-10 rounded-[3rem] shadow-sm border border-slate-100">
-               <h2 className="text-3xl font-black text-slate-800 tracking-tight mb-4">Protocolo de Carga Histerética</h2>
-               <p className="text-slate-400 text-sm max-w-2xl mb-10">
-                 Este modo protege los componentes cortando la luz totalmente mientras la batería tenga energía suficiente. Solo se conecta a la red cuando es estrictamente necesario.
-               </p>
-
-               <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                 <div className="p-8 bg-slate-50 rounded-[2.5rem] border border-slate-100">
-                    <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center text-orange-500 mb-4 shadow-sm">
-                      <i className="fas fa-battery-empty"></i>
-                    </div>
-                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Umbral Inicio</p>
-                    <p className="text-3xl font-black text-slate-800">10%</p>
-                 </div>
-                 <div className="p-8 bg-slate-50 rounded-[2.5rem] border border-slate-100">
-                    <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center text-teal-500 mb-4 shadow-sm">
-                      <i className="fas fa-battery-full"></i>
-                    </div>
-                    <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Umbral Parada</p>
-                    <p className="text-3xl font-black text-slate-800">100%</p>
-                 </div>
-                 <div className="p-8 bg-orange-50 rounded-[2.5rem] border border-orange-100">
-                    <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center text-orange-600 mb-4 shadow-sm">
-                      <i className="fas fa-microchip"></i>
-                    </div>
-                    <p className="text-[10px] font-black text-orange-900 uppercase tracking-widest mb-1">Corte Térmico</p>
-                    <p className="text-3xl font-black text-orange-800">ACTIVO</p>
-                 </div>
-               </div>
-            </div>
-          </div>
-        )}
-
         {activeTab === 'hardware' && <HardwareRequirements />}
       </main>
 
-      {/* Nav Mobile */}
-      <nav className="fixed bottom-8 left-8 right-8 bg-slate-900/90 backdrop-blur-xl rounded-[2.5rem] p-4 flex justify-around shadow-2xl z-40 border border-white/10 md:hidden">
-        {[
-          { icon: 'fa-house', tab: 'dashboard' },
-          { icon: 'fa-battery-bolt', tab: 'power' },
-          { icon: 'fa-users', tab: 'users' },
-          { icon: 'fa-sliders', tab: 'hardware' }
-        ].map(item => (
-          <button key={item.tab} onClick={() => setActiveTab(item.tab as any)} className={`w-12 h-12 rounded-2xl flex items-center justify-center transition-all ${activeTab === item.tab ? 'bg-orange-500 text-white scale-110' : 'text-slate-500'}`}>
-            <i className={`fas ${item.icon} text-lg`}></i>
-          </button>
-        ))}
-      </nav>
-
       <style>{`
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        .animate-fadeIn { animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
-        .animate-spin-slow { animation: spin 12s linear infinite; }
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        .animate-spin-slow { animation: spin 10s linear infinite; }
       `}</style>
     </div>
   );
