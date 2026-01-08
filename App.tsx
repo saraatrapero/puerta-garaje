@@ -34,17 +34,23 @@ const App: React.FC = () => {
   const [doorState, setDoorState] = useState<DoorStatus>(DoorStatus.CLOSED);
   const [activeTab, setActiveTab] = useState<'dashboard' | 'users' | 'logs' | 'power' | 'hardware'>('dashboard');
   
-  // Power & Thermal Management
+  // Kit 400 Specific State
+  const [autoCloseTime, setAutoCloseTime] = useState<0 | 20 | 40 | 60>(0);
+  const [isIrBlocked, setIsIrBlocked] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  
+  // Power & Thermal
   const [batteryLevel, setBatteryLevel] = useState(15);
-  const [chargingCycleRequired, setChargingCycleRequired] = useState(false); // Histéresis 10-100%
-  const [isChargingActive, setIsChargingActive] = useState(false); // Estado real Pin D3
-  const [isProcessing, setIsProcessing] = useState(false); // Actividad Cámara/LPR
+  const [isChargingActive, setIsChargingActive] = useState(false);
   const [cpuTemp, setCpuTemp] = useState(35);
 
-  const [users] = useState<AccessUser[]>([
+  const [users, setUsers] = useState<AccessUser[]>([
     { id: '1', name: 'Admin Principal', phone: '+34600112233', plate: '1234ABC', type: UserType.PERMANENT, active: true },
+    { id: '2', name: 'Visitante Demo', phone: '+34611223344', plate: '5678DEF', type: UserType.TEMPORARY, active: true },
   ]);
-  const [logs, setLogs] = useState<AccessLog[]>([]);
+  const [logs, setLogs] = useState<AccessLog[]>([
+    { id: 'l1', timestamp: new Date().toISOString(), userName: 'Admin Principal', plate: '1234ABC', action: 'ENTRY', method: 'ADMIN' }
+  ]);
   const [isAwaiting2FA, setIsAwaiting2FA] = useState<AccessUser | null>(null);
 
   // Live Intercom State
@@ -58,37 +64,33 @@ const App: React.FC = () => {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Ciclo de Vida Inteligente de Batería y Temperatura
+  // Simulación de Sensores Kit 400
   useEffect(() => {
-    const batteryManager = setInterval(() => {
+    const sensorSim = setInterval(() => {
+      if (doorState === DoorStatus.OPEN) {
+        setIsIrBlocked(Math.random() > 0.9);
+      } else {
+        setIsIrBlocked(false);
+      }
+    }, 5000);
+    return () => clearInterval(sensorSim);
+  }, [doorState]);
+
+  // Lógica de Energía
+  useEffect(() => {
+    const powerSim = setInterval(() => {
       setBatteryLevel(prev => {
-        // Lógica de histéresis: activa a 10%, desactiva a 100%
-        if (prev <= 10) setChargingCycleRequired(true);
-        if (prev >= 100) setChargingCycleRequired(false);
-
-        if (isChargingActive) return Math.min(100, prev + 0.5);
-        return Math.max(0, prev - 0.1);
+        if (isChargingActive) return Math.min(100, prev + 0.2);
+        return Math.max(0, prev - 0.05);
       });
-
-      // Simulación de Temperatura (Procesador + Carga)
       setCpuTemp(prev => {
-        let target = 32;
-        if (isChargingActive) target += 10;
-        if (isProcessing || isIntercomActive) target += 15;
-        return prev < target ? prev + 0.4 : prev - 0.2;
+        let target = 30 + (isProcessing ? 15 : 0) + (isChargingActive ? 10 : 0);
+        return prev < target ? prev + 0.5 : prev - 0.2;
       });
     }, 2000);
-    return () => clearInterval(batteryManager);
-  }, [isChargingActive, isProcessing, isIntercomActive]);
+    return () => clearInterval(powerSim);
+  }, [isChargingActive, isProcessing]);
 
-  // Lógica del Pin D3 (MOSFET de Carga)
-  useEffect(() => {
-    // REGLA: Solo cargar si el ciclo lo pide Y NO hay actividad de video/voz
-    const hardwareD3State = chargingCycleRequired && !isProcessing && !isIntercomActive;
-    setIsChargingActive(hardwareD3State);
-  }, [chargingCycleRequired, isProcessing, isIntercomActive]);
-
-  // --- Live Intercom Logic ---
   const startIntercom = async () => {
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -134,7 +136,7 @@ const App: React.FC = () => {
         },
         config: {
           responseModalities: [Modality.AUDIO],
-          systemInstruction: 'Eres el interfono de seguridad de un garaje. Habla con claridad y profesionalidad.'
+          systemInstruction: 'Eres el interfono de seguridad de un garaje con motor KIT 400. Ayuda al administrador a validar visitas.'
         }
       });
       intercomSessionRef.current = await sessionPromise;
@@ -150,13 +152,14 @@ const App: React.FC = () => {
   };
 
   const triggerRelay = (action: 'OPEN' | 'CLOSE' | 'STOP', user?: AccessUser) => {
+    if (action === 'CLOSE' && isIrBlocked) return;
     const statusMap = { OPEN: DoorStatus.OPENING, CLOSE: DoorStatus.CLOSING, STOP: DoorStatus.STOPPED };
     setDoorState(statusMap[action]);
     if (user && action === 'OPEN') {
       setLogs([{ id: Math.random().toString(36).substr(2, 9), timestamp: new Date().toISOString(), userName: user.name, plate: user.plate, action: 'ENTRY', method: 'LPR' }, ...logs]);
       setIsAwaiting2FA(null);
     }
-    if (action !== 'STOP') setTimeout(() => setDoorState(action === 'OPEN' ? DoorStatus.OPEN : DoorStatus.CLOSED), 4000);
+    setTimeout(() => setDoorState(action === 'OPEN' ? DoorStatus.OPEN : DoorStatus.CLOSED), 4000);
   };
 
   const handleLPR = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -182,16 +185,16 @@ const App: React.FC = () => {
         <div className="max-w-6xl mx-auto flex justify-between items-center">
           <div className="flex items-center gap-4">
             <div className="w-12 h-12 bg-indigo-600 rounded-2xl flex items-center justify-center shadow-lg shadow-indigo-900/40">
-              <i className="fas fa-microchip text-white text-xl"></i>
+              <i className="fas fa-gate text-white text-xl"></i>
             </div>
             <div>
-              <h1 className="text-white font-black uppercase tracking-tighter text-xl">XIAO <span className="text-indigo-400">SMART-POWER</span></h1>
-              <p className="text-[9px] text-slate-400 font-bold tracking-widest uppercase">Modelo 400 Integrated</p>
+              <h1 className="text-white font-black uppercase tracking-tighter text-xl">KIT <span className="text-indigo-400">CORREDERA 400</span></h1>
+              <p className="text-[9px] text-slate-400 font-bold tracking-widest uppercase">XIAO Bridge & LPR System</p>
             </div>
           </div>
           <div className="hidden md:flex gap-8">
             {['dashboard', 'users', 'logs', 'power', 'hardware'].map(t => (
-              <button key={t} onClick={() => setActiveTab(t as any)} className={`text-[10px] font-black uppercase tracking-widest ${activeTab === t ? 'text-indigo-400 underline underline-offset-8' : 'text-slate-500'}`}>{t}</button>
+              <button key={t} onClick={() => setActiveTab(t as any)} className={`text-[10px] font-black uppercase tracking-widest transition-all ${activeTab === t ? 'text-indigo-400 underline underline-offset-8 scale-110' : 'text-slate-500 hover:text-slate-300'}`}>{t}</button>
             ))}
           </div>
         </div>
@@ -201,19 +204,17 @@ const App: React.FC = () => {
         {activeTab === 'dashboard' && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
             <div className="lg:col-span-2 bg-white rounded-[3.5rem] p-12 shadow-sm border border-slate-200 flex flex-col items-center relative overflow-hidden">
-              
-              {/* Telemetría en Tiempo Real */}
-              <div className="absolute top-10 left-10 flex gap-3">
-                 <div className={`px-4 py-2 rounded-2xl border flex items-center gap-3 ${isChargingActive ? 'bg-indigo-50 border-indigo-100 text-indigo-600' : 'bg-slate-50 border-slate-100 text-slate-400'}`}>
-                    <i className={`fas ${isChargingActive ? 'fa-bolt-lightning animate-pulse' : 'fa-battery-full'}`}></i>
-                    <span className="text-[10px] font-black uppercase tracking-widest">{isChargingActive ? 'Cargando de 220V' : 'Modo Batería'}</span>
-                 </div>
-                 {(isProcessing || isIntercomActive) && (
-                   <div className="px-4 py-2 rounded-2xl bg-orange-50 border border-orange-100 text-orange-600 flex items-center gap-2 animate-pulse">
-                      <i className="fas fa-shield-halved"></i>
-                      <span className="text-[10px] font-black uppercase tracking-widest">Protección Térmica</span>
+              <div className="absolute top-10 left-10 flex flex-col gap-3">
+                 {isIrBlocked && (
+                   <div className="px-4 py-2 rounded-2xl bg-rose-50 border border-rose-100 text-rose-600 flex items-center gap-3 animate-pulse">
+                      <i className="fas fa-triangle-exclamation"></i>
+                      <span className="text-[10px] font-black uppercase tracking-widest">IR BLOQUEADO</span>
                    </div>
                  )}
+                 <div className={`px-4 py-2 rounded-2xl border flex items-center gap-3 ${isChargingActive ? 'bg-indigo-50 border-indigo-100 text-indigo-600' : 'bg-slate-50 border-slate-100 text-slate-400'}`}>
+                    <i className={`fas ${isChargingActive ? 'fa-bolt-lightning animate-pulse' : 'fa-battery-full'}`}></i>
+                    <span className="text-[10px] font-black uppercase tracking-widest">{batteryLevel.toFixed(0)}% LiPo</span>
+                 </div>
               </div>
 
               <div className={`w-72 h-72 rounded-full flex items-center justify-center transition-all duration-1000 ${doorState === DoorStatus.OPEN ? 'bg-teal-50' : 'bg-slate-50'}`}>
@@ -223,79 +224,166 @@ const App: React.FC = () => {
 
               <h2 className="text-5xl font-black mt-10 text-slate-900 tracking-tighter uppercase">{doorState}</h2>
 
-              {/* Controles de 3 Botones (X7) */}
-              <div className="grid grid-cols-3 gap-6 mt-12 w-full max-w-md">
-                <button onClick={() => triggerRelay('OPEN')} className="flex flex-col items-center gap-3 p-6 bg-slate-900 text-white rounded-[2.5rem] hover:bg-indigo-600 transition-all shadow-xl active:scale-95 group">
-                  <i className="fas fa-chevron-up text-xl group-hover:-translate-y-1 transition-transform"></i>
-                  <span className="text-[10px] font-black uppercase tracking-widest">Abrir</span>
-                </button>
-                <button onClick={() => triggerRelay('STOP')} className="flex flex-col items-center gap-3 p-6 bg-rose-500 text-white rounded-[2.5rem] hover:bg-rose-600 transition-all shadow-xl active:scale-95 group">
-                  <i className="fas fa-stop text-xl group-hover:scale-110 transition-transform"></i>
-                  <span className="text-[10px] font-black uppercase tracking-widest">Parar</span>
-                </button>
-                <button onClick={() => triggerRelay('CLOSE')} className="flex flex-col items-center gap-3 p-6 bg-slate-900 text-white rounded-[2.5rem] hover:bg-indigo-600 transition-all shadow-xl active:scale-95 group">
-                  <i className="fas fa-chevron-down text-xl group-hover:translate-y-1 transition-transform"></i>
-                  <span className="text-[10px] font-black uppercase tracking-widest">Cerrar</span>
-                </button>
-              </div>
-
-              {/* Interfono de Voz */}
-              <div className="mt-10 flex flex-col items-center gap-3">
-                <button 
-                  onClick={isIntercomActive ? stopIntercom : startIntercom}
-                  className={`w-16 h-16 rounded-full flex items-center justify-center transition-all ${isIntercomActive ? 'bg-rose-600 animate-pulse text-white' : 'bg-indigo-100 text-indigo-600 hover:bg-indigo-200'}`}
-                >
-                  <i className={`fas ${isIntercomActive ? 'fa-microphone-slash' : 'fa-microphone'} text-xl`}></i>
-                </button>
-                <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Interfono Digital XIAO</span>
+              <div className="mt-12 bg-slate-900 p-8 rounded-[3rem] shadow-2xl border-4 border-slate-800 flex flex-col gap-6 w-full max-w-[280px]">
+                <div className="grid grid-cols-2 gap-4">
+                  <button onClick={() => triggerRelay('OPEN')} className="aspect-square bg-slate-800 rounded-2xl flex flex-col items-center justify-center text-indigo-400 hover:bg-slate-700 active:scale-95 transition-all group">
+                    <i className="fas fa-caret-up text-3xl mb-2"></i>
+                    <span className="text-[8px] font-black uppercase tracking-widest">OPEN</span>
+                  </button>
+                  <button onClick={() => triggerRelay('STOP')} className="aspect-square bg-slate-800 rounded-2xl flex flex-col items-center justify-center text-rose-500 hover:bg-slate-700 active:scale-95 transition-all group">
+                    <i className="fas fa-stop text-2xl mb-2"></i>
+                    <span className="text-[8px] font-black uppercase tracking-widest">STOP</span>
+                  </button>
+                  <button onClick={() => triggerRelay('CLOSE')} className="aspect-square bg-slate-800 rounded-2xl flex flex-col items-center justify-center text-indigo-400 hover:bg-slate-700 active:scale-95 transition-all group">
+                    <i className="fas fa-caret-down text-3xl mb-2"></i>
+                    <span className="text-[8px] font-black uppercase tracking-widest">CLOSE</span>
+                  </button>
+                  <button onClick={isIntercomActive ? stopIntercom : startIntercom} className={`aspect-square rounded-2xl flex flex-col items-center justify-center active:scale-95 transition-all group ${isIntercomActive ? 'bg-rose-600 text-white' : 'bg-slate-800 text-slate-500 hover:bg-slate-700'}`}>
+                    <i className={`fas ${isIntercomActive ? 'fa-microphone-slash' : 'fa-microphone'} text-2xl mb-2`}></i>
+                    <span className="text-[8px] font-black uppercase tracking-widest">VOICE</span>
+                  </button>
+                </div>
               </div>
               
-              <button onClick={() => fileInputRef.current?.click()} className="mt-8 text-slate-300 hover:text-indigo-400 font-bold text-[9px] uppercase tracking-widest">Lanzar LPR Manual</button>
+              <button onClick={() => fileInputRef.current?.click()} className="mt-8 text-slate-300 hover:text-indigo-400 font-bold text-[9px] uppercase tracking-widest flex items-center gap-2">
+                 <i className="fas fa-camera"></i> TEST LPR (CAM-XIAO)
+              </button>
               <input type="file" ref={fileInputRef} className="hidden" onChange={handleLPR} />
             </div>
 
             <div className="space-y-6">
-              {/* Salud de Batería e IA */}
-              <div className="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-200 overflow-hidden relative">
-                <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-8">Estado de Energía</h3>
-                <div className="space-y-6">
-                  <div className="flex justify-between items-end">
-                    <div>
-                      <p className="text-4xl font-black text-slate-900 tracking-tighter">{batteryLevel.toFixed(0)}%</p>
-                      <p className="text-[10px] font-black text-slate-400 uppercase mt-1">Carga Actual</p>
+              <div className="bg-white p-8 rounded-[2.5rem] shadow-sm border border-slate-200">
+                <h3 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-6">Configuración de Placa (DIP)</h3>
+                <div className="space-y-4">
+                  <div className="flex items-center justify-between p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                    <div className="flex items-center gap-3">
+                       <i className="fas fa-clock-rotate-left text-indigo-600"></i>
+                       <span className="text-[10px] font-black uppercase">Auto-cierre</span>
                     </div>
-                    <div className="text-right">
-                      <p className={`text-xl font-black tracking-tighter ${cpuTemp > 45 ? 'text-orange-500' : 'text-slate-900'}`}>{cpuTemp.toFixed(1)}°C</p>
-                      <p className="text-[10px] font-black text-slate-400 uppercase mt-1">CPU XIAO S3</p>
-                    </div>
-                  </div>
-                  <div className="h-3 w-full bg-slate-100 rounded-full overflow-hidden">
-                    <div className={`h-full transition-all duration-1000 ${isChargingActive ? 'bg-indigo-500' : 'bg-teal-500'}`} style={{ width: `${batteryLevel}%` }}></div>
-                  </div>
-                  <div className={`p-4 rounded-2xl text-[10px] font-black uppercase leading-tight border ${isChargingActive ? 'bg-indigo-50 border-indigo-100 text-indigo-700' : 'bg-slate-50 border-slate-100 text-slate-500'}`}>
-                     <i className={`fas ${isChargingActive ? 'fa-bolt mr-2' : 'fa-moon mr-2'}`}></i>
-                     {isChargingActive 
-                        ? 'Carga Activa: Alimentador de 220V conectado' 
-                        : isProcessing || isIntercomActive
-                           ? 'Carga Pausada: Protegiendo hardware por actividad'
-                           : 'Alimentador de 220V Desconectado (Modo Eco)'}
+                    <select 
+                      value={autoCloseTime} 
+                      onChange={(e) => setAutoCloseTime(Number(e.target.value) as any)}
+                      className="bg-transparent border-none text-[10px] font-black text-slate-900 focus:ring-0"
+                    >
+                      <option value={0}>OFF</option>
+                      <option value={20}>20 Seg</option>
+                      <option value={40}>40 Seg</option>
+                      <option value={60}>1 Min</option>
+                    </select>
                   </div>
                 </div>
-              </div>
-
-              <div className="bg-slate-900 p-8 rounded-[2.5rem] text-white shadow-2xl relative">
-                <h3 className="text-[10px] font-black text-indigo-400 uppercase tracking-widest mb-4">Gemini Bridge</h3>
-                <p className="text-sm text-slate-400 leading-relaxed italic">"He configurado la carga por umbrales: El cargador dormirá hasta que la batería llegue al 10%, optimizando la salud del circuito del XIAO."</p>
               </div>
             </div>
           </div>
         )}
+
+        {activeTab === 'users' && (
+          <div className="space-y-6 animate-fadeIn">
+            <div className="flex justify-between items-center mb-6">
+              <h2 className="text-3xl font-black text-slate-800 tracking-tight">Usuarios Autorizados</h2>
+              <button className="bg-indigo-600 text-white px-6 py-3 rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-indigo-600/20">Añadir Usuario</button>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {users.map(user => (
+                <div key={user.id} className="bg-white p-8 rounded-[2.5rem] border border-slate-200 shadow-sm hover:border-indigo-200 transition-all">
+                  <div className="flex justify-between items-start mb-6">
+                    <div className="w-12 h-12 bg-slate-50 rounded-2xl flex items-center justify-center font-black text-slate-400">{user.name.charAt(0)}</div>
+                    <span className={`text-[8px] font-black px-2 py-1 rounded-md uppercase ${user.type === UserType.PERMANENT ? 'bg-indigo-50 text-indigo-600' : 'bg-amber-50 text-amber-600'}`}>{user.type}</span>
+                  </div>
+                  <h4 className="font-black text-slate-900 uppercase tracking-tight">{user.name}</h4>
+                  <p className="text-[10px] font-bold text-slate-400 mt-1">{user.phone}</p>
+                  <div className="mt-6 pt-6 border-t border-slate-100 flex justify-between items-center">
+                    <span className="font-mono text-sm font-black text-indigo-600">{user.plate}</span>
+                    <button className="text-rose-400 hover:text-rose-600"><i className="fas fa-trash"></i></button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'logs' && (
+          <div className="space-y-6 animate-fadeIn">
+            <h2 className="text-3xl font-black text-slate-800 tracking-tight mb-6">Historial de Accesos</h2>
+            <div className="bg-white rounded-[2.5rem] border border-slate-200 shadow-sm overflow-hidden">
+              <div className="divide-y divide-slate-100">
+                {logs.map(log => (
+                  <div key={log.id} className="p-6 flex items-center justify-between hover:bg-slate-50 transition-colors">
+                    <div className="flex items-center gap-4">
+                      <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${log.action === 'ENTRY' ? 'bg-teal-50 text-teal-600' : 'bg-rose-50 text-rose-600'}`}>
+                        <i className={`fas ${log.action === 'ENTRY' ? 'fa-arrow-right-to-bracket' : 'fa-shield-halved'}`}></i>
+                      </div>
+                      <div>
+                        <p className="text-sm font-black text-slate-900 uppercase tracking-tight">{log.userName}</p>
+                        <p className="text-[10px] font-bold text-slate-400">{new Date(log.timestamp).toLocaleString()}</p>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-[10px] font-black text-indigo-600 uppercase mb-1">{log.method}</p>
+                      <p className="font-mono text-xs font-black text-slate-600">{log.plate}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'power' && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-8 animate-fadeIn">
+            <div className="bg-white p-10 rounded-[3.5rem] border border-slate-200 shadow-sm">
+              <h3 className="text-xl font-black text-slate-900 mb-8 uppercase tracking-tighter">Estado de Batería</h3>
+              <div className="flex items-end gap-6 mb-8">
+                <span className="text-6xl font-black text-slate-900 tracking-tighter">{batteryLevel.toFixed(0)}%</span>
+                <span className={`text-[10px] font-black uppercase px-3 py-1 rounded-full ${isChargingActive ? 'bg-indigo-100 text-indigo-600' : 'bg-slate-100 text-slate-500'}`}>
+                  {isChargingActive ? 'Cargando...' : 'Descargando'}
+                </span>
+              </div>
+              <div className="h-4 w-full bg-slate-100 rounded-full overflow-hidden">
+                <div className={`h-full transition-all duration-1000 ${batteryLevel > 20 ? 'bg-indigo-500' : 'bg-rose-500'}`} style={{ width: `${batteryLevel}%` }}></div>
+              </div>
+              <div className="mt-10 grid grid-cols-2 gap-4">
+                 <button 
+                  onClick={() => setIsChargingActive(!isChargingActive)}
+                  className={`p-6 rounded-[2rem] font-black uppercase text-[10px] tracking-widest transition-all ${isChargingActive ? 'bg-rose-50 text-rose-600' : 'bg-indigo-600 text-white shadow-lg shadow-indigo-200'}`}
+                 >
+                   {isChargingActive ? 'Detener Carga' : 'Iniciar Carga Manual'}
+                 </button>
+                 <div className="p-6 bg-slate-50 rounded-[2rem] border border-slate-100 text-center">
+                    <p className="text-sm font-black text-slate-900">{cpuTemp.toFixed(1)}°C</p>
+                    <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest mt-1">CPU XIAO</p>
+                 </div>
+              </div>
+            </div>
+
+            <div className="bg-slate-900 p-10 rounded-[3.5rem] text-white shadow-2xl relative overflow-hidden">
+              <h3 className="text-xl font-black mb-6 uppercase tracking-tighter text-indigo-400">Protección Térmica IA</h3>
+              <p className="text-sm text-slate-400 leading-relaxed mb-8">
+                El sistema monitoriza constantemente la temperatura del procesador ESP32-S3. Si se detecta una carga térmica excesiva durante el procesamiento de video o voz, la carga de la batería se suspende automáticamente para preservar la vida útil del hardware.
+              </p>
+              <div className="space-y-4">
+                 <div className="flex justify-between items-center p-4 bg-white/5 rounded-2xl">
+                    <span className="text-xs font-bold text-slate-300">Límite Seguro</span>
+                    <span className="text-xs font-black text-indigo-400">65.0°C</span>
+                 </div>
+                 <div className="flex justify-between items-center p-4 bg-white/5 rounded-2xl">
+                    <span className="text-xs font-bold text-slate-300">Histeresis Carga</span>
+                    <span className="text-xs font-black text-indigo-400">10% - 95%</span>
+                 </div>
+              </div>
+              <i className="fas fa-temperature-half absolute -bottom-10 -right-10 text-[12rem] opacity-5"></i>
+            </div>
+          </div>
+        )}
+
         {activeTab === 'hardware' && <HardwareRequirements />}
       </main>
 
       <style>{`
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         .animate-spin-slow { animation: spin 10s linear infinite; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-fadeIn { animation: fadeIn 0.4s ease-out forwards; }
       `}</style>
     </div>
   );
